@@ -1,0 +1,7 @@
+{
+  "name": "ZynCut AI",
+  "description": "Professional AI-powered background removal tool with one-click functionality and instant transparent PNG results.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
