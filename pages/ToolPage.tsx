@@ -61,6 +61,113 @@ const ToolPage: React.FC = () => {
     setError(null);
   };
 
+  const dataUrlToBlob = (dataUrl: string) => {
+    const [meta, data] = dataUrl.split(',');
+    const mimeMatch = meta.match(/data:(.*?)(;base64)?$/);
+    const mimeType = mimeMatch?.[1] || 'application/octet-stream';
+    const isBase64 = meta.includes(';base64');
+    const byteString = isBase64 ? atob(data) : decodeURIComponent(data);
+    const bytes = new Uint8Array(byteString.length);
+    for (let i = 0; i < byteString.length; i += 1) bytes[i] = byteString.charCodeAt(i);
+    return new Blob([bytes], { type: mimeType });
+  };
+
+  const blobToDataUrl = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.onerror = () => reject(new Error('Failed to read image'));
+      reader.readAsDataURL(blob);
+    });
+  };
+
+  const getUploadBlob = async (currentPreview: string) => {
+    const filename = file?.name || 'image.png';
+    if (file) return { blob: file as Blob, filename };
+    if (currentPreview.startsWith('data:')) return { blob: dataUrlToBlob(currentPreview), filename };
+    const response = await fetch(currentPreview);
+    if (!response.ok) throw new Error('Failed to load image');
+    const blob = await response.blob();
+    return { blob, filename };
+  };
+
+  const sendImageToWebhook = async (blob: Blob, filename: string): Promise<string | null> => {
+    const formData = new FormData();
+    formData.append('image', blob, filename);
+
+    const webhookUrl =
+      (import.meta.env.VITE_N8N_WEBHOOK_URL as string | undefined) ||
+      (import.meta.env.DEV
+        ? '/api/remover-background'
+        : 'https://furqanraza978.app.n8n.cloud/webhook-test/remove-background');
+
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const json: any = await response.json().catch(() => null);
+        const message = typeof json?.message === 'string' ? json.message : '';
+        const hint = typeof json?.hint === 'string' ? json.hint : '';
+
+        if (response.status === 404 && message.toLowerCase().includes('not registered')) {
+          const extra = hint ? ` ${hint}` : '';
+          throw new Error(
+            `n8n webhook-test active nahi hai.${extra} Workflow mein "Execute workflow" click karke phir try karein (test mode usually sirf 1 call allow karta hai).`
+          );
+        }
+
+        throw new Error(`Webhook request failed: ${response.status} ${JSON.stringify(json)}`);
+      }
+
+      const text = await response.text().catch(() => '');
+      if (
+        response.status >= 500 &&
+        (text.includes('Internal Server Error') || text.toLowerCase().includes('<!doctype html'))
+      ) {
+        throw new Error(
+          'n8n side par Internal Server Error aa raha hai. n8n workflow executions/logs check karein. Webhook node POST ho, aur incoming binary `image` ko handle karne wala node sahi configured ho.'
+        );
+      }
+      const message = text ? `${response.status} ${text}` : `${response.status}`;
+      throw new Error(`Webhook request failed: ${message}`);
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+
+    if (contentType.includes('application/json')) {
+      const json: any = await response.json();
+      const candidate =
+        (typeof json?.dataUrl === 'string' && json.dataUrl) ||
+        (typeof json?.result === 'string' && json.result) ||
+        (typeof json?.image === 'string' && json.image) ||
+        (typeof json?.base64 === 'string' && json.base64) ||
+        (typeof json?.data === 'string' && json.data) ||
+        null;
+
+      if (!candidate) return null;
+      if (candidate.startsWith('data:')) return candidate;
+
+      const mimeType = typeof json?.mimeType === 'string' ? json.mimeType : 'image/png';
+      const base64 = candidate.includes(',') ? candidate.split(',').pop() : candidate;
+      return `data:${mimeType};base64,${base64}`;
+    }
+
+    if (contentType.startsWith('image/')) {
+      const outBlob = await response.blob();
+      return blobToDataUrl(outBlob);
+    }
+
+    const buffer = await response.arrayBuffer();
+    if (!buffer.byteLength) return null;
+
+    const outBlob = new Blob([buffer], { type: contentType || 'image/png' });
+    return blobToDataUrl(outBlob);
+  };
+
   const applyChromaKey = (base64: string): Promise<string> => {
     return new Promise((resolve) => {
       const img = new Image();
@@ -105,11 +212,49 @@ const ToolPage: React.FC = () => {
     setError(null);
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      
-      // Extract base64 data from the preview URL
-      const base64Data = preview.split(',')[1];
-      const mimeType = preview.split(';')[0].split(':')[1];
+      let previewDataUrl = preview;
+      if (!previewDataUrl.startsWith('data:')) {
+        const previewBlob = await fetch(previewDataUrl).then((r) => r.blob());
+        previewDataUrl = await blobToDataUrl(previewBlob);
+      }
+
+      const { blob: uploadBlob, filename } = await getUploadBlob(previewDataUrl);
+
+      setProgress(20);
+
+      const apiKey = process.env.API_KEY || '';
+      let webhookResult: string | null = null;
+      let webhookError: unknown = null;
+      try {
+        webhookResult = await sendImageToWebhook(uploadBlob, filename);
+      } catch (e) {
+        webhookError = e;
+      }
+
+      if (webhookResult) {
+        setProgress(85);
+        const transparentResult = await applyChromaKey(webhookResult);
+        setProgress(100);
+        setResult(transparentResult);
+        incrementUsage();
+        addToHistory({
+          id: Math.random().toString(36).substr(2, 9),
+          original: preview,
+          result: transparentResult,
+          timestamp: Date.now(),
+        });
+        return;
+      }
+
+      if (!apiKey) {
+        if (webhookError instanceof Error) throw webhookError;
+        throw new Error('GEMINI_API_KEY missing, aur webhook se bhi result nahi aya.');
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
+
+      const base64Data = previewDataUrl.split(',')[1];
+      const mimeType = previewDataUrl.split(';')[0].split(':')[1];
 
       setProgress(30);
 
