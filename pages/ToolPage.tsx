@@ -81,6 +81,25 @@ const ToolPage: React.FC = () => {
     });
   };
 
+  const sniffMimeFromBuffer = (buffer: ArrayBuffer): string => {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length >= 12) {
+      const png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+      let isPng = true;
+      for (let i = 0; i < png.length; i++) {
+        if (bytes[i] !== png[i]) { isPng = false; break; }
+      }
+      if (isPng) return 'image/png';
+      if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return 'image/jpeg';
+      if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return 'image/gif';
+      if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+          bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+        return 'image/webp';
+      }
+    }
+    return 'application/octet-stream';
+  };
+
   const getUploadBlob = async (currentPreview: string) => {
     const filename = file?.name || 'image.png';
     if (file) return { blob: file as Blob, filename };
@@ -92,8 +111,18 @@ const ToolPage: React.FC = () => {
   };
 
   const sendImageToWebhook = async (blob: Blob, filename: string): Promise<string | null> => {
-    const formData = new FormData();
-    formData.append('image', blob, filename);
+    const binaryField = (import.meta.env.VITE_N8N_BINARY_FIELD as string | undefined) || 'data';
+    const sendRaw = String(import.meta.env.VITE_N8N_SEND_RAW || '').toLowerCase() === 'true';
+    let body: BodyInit;
+    let extraHeaders: Record<string, string> = {};
+    if (sendRaw) {
+      body = blob;
+      extraHeaders['Content-Type'] = blob.type || 'application/octet-stream';
+    } else {
+      const formData = new FormData();
+      formData.append(binaryField, blob, filename);
+      body = formData;
+    }
 
     const webhookUrl =
       (import.meta.env.VITE_N8N_WEBHOOK_URL as string | undefined) ||
@@ -103,7 +132,11 @@ const ToolPage: React.FC = () => {
 
     const response = await fetch(webhookUrl, {
       method: 'POST',
-      body: formData,
+      body,
+      headers: {
+        Accept: 'application/json, image/*;q=0.9, */*;q=0.8',
+        ...extraHeaders,
+      },
     });
 
     if (!response.ok) {
@@ -139,8 +172,27 @@ const ToolPage: React.FC = () => {
     const contentType = response.headers.get('content-type') || '';
 
     if (contentType.includes('application/json')) {
-      const json: any = await response.json();
+      const text = await response.text();
+      console.log("Raw webhook response:", text);
+      if (!text) {
+        return null;
+      }
+      const data = JSON.parse(text);
+      const json = Array.isArray(data) ? data[0] : data;
+
+      if (!json) {
+        return null;
+      }
+      
+      let url = null;
+      if (typeof json.url === 'string') {
+        url = json.url;
+      } else if (typeof json.Url === 'string') {
+        url = json.Url;
+      }
+
       const candidate =
+        url?.trim().replace(/`/g, '') ||
         (typeof json?.dataUrl === 'string' && json.dataUrl) ||
         (typeof json?.result === 'string' && json.result) ||
         (typeof json?.image === 'string' && json.image) ||
@@ -149,7 +201,7 @@ const ToolPage: React.FC = () => {
         null;
 
       if (!candidate) return null;
-      if (candidate.startsWith('data:')) return candidate;
+      if (candidate.startsWith('data:') || candidate.startsWith('http')) return candidate;
 
       const mimeType = typeof json?.mimeType === 'string' ? json.mimeType : 'image/png';
       const base64 = candidate.includes(',') ? candidate.split(',').pop() : candidate;
@@ -164,7 +216,8 @@ const ToolPage: React.FC = () => {
     const buffer = await response.arrayBuffer();
     if (!buffer.byteLength) return null;
 
-    const outBlob = new Blob([buffer], { type: contentType || 'image/png' });
+    const sniffed = sniffMimeFromBuffer(buffer);
+    const outBlob = new Blob([buffer], { type: contentType || sniffed || 'application/octet-stream' });
     return blobToDataUrl(outBlob);
   };
 
@@ -229,18 +282,20 @@ const ToolPage: React.FC = () => {
         webhookResult = await sendImageToWebhook(uploadBlob, filename);
       } catch (e) {
         webhookError = e;
+        try {
+          // eslint-disable-next-line no-console
+          console.error('Webhook Error:', e);
+        } catch {}
       }
 
       if (webhookResult) {
-        setProgress(85);
-        const transparentResult = await applyChromaKey(webhookResult);
         setProgress(100);
-        setResult(transparentResult);
+        setResult(webhookResult);
         incrementUsage();
         addToHistory({
           id: Math.random().toString(36).substr(2, 9),
           original: preview,
-          result: transparentResult,
+          result: webhookResult,
           timestamp: Date.now(),
         });
         return;
@@ -308,8 +363,7 @@ const ToolPage: React.FC = () => {
       });
 
     } catch (err: any) {
-      console.error("BG Removal Error:", err);
-      setError(err.message || "Failed to process image. Please try again.");
+      setError("Your picture was not added correctly, please try again.");
     } finally {
       setIsProcessing(false);
     }
